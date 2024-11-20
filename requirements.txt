@@ -1,0 +1,4 @@
+python-dotenv
+pyautogui
+Pillow
+openai

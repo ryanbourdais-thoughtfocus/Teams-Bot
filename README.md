@@ -50,6 +50,16 @@ The data flow through the application can be summarized in the following steps:
 10. **Repeat**:
     - The bot waits for a specified duration (e.g., 10 seconds) before repeating the process.
 
+## State Management
+
+The bot operates using a state machine with the following states defined in the `State` enum:
+
+- **POLLING**: The initial state where the bot checks for Teams notifications in the taskbar.
+- **IN_TEAMS**: Indicates that the bot is currently in the Teams application and ready to analyze messages.
+- **MESSAGE_FOUND**: Indicates that an unread message has been detected, and the bot is preparing to respond.
+- **CONFIDENCE_CHECK**: The bot is checking for the presence of a last read bar in the chat to confirm the message's context.
+- **RESPONSE_SENT**: Indicates that the bot has sent a response to the detected message and is preparing to return to the POLLING state.
+
 ## Requirements
 
 - Python 3.x
