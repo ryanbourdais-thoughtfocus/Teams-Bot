@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import json
 from PIL import Image, ImageDraw, ImageFont
+from enum import Enum
 
 # Load environment variables from .env file
 load_dotenv()
@@ -13,7 +14,18 @@ load_dotenv()
 # Initialize OpenAI with your API key
 openai_api_key = os.getenv('OPENAI_API_KEY')
 client = OpenAI(api_key=openai_api_key)
-spacing = 50 
+spacing = 35 
+
+# Define the state enum
+class State(Enum):
+    POLLING = "polling"
+    IN_TEAMS = "in_teams"
+    MESSAGE_FOUND = "message_found"
+    CONFIDENCE_CHECK = "confidence_check"
+    RESPONSE_SENT = "response_sent"
+
+current_state = State.POLLING
+high_confidence_yes_count = 0
 
 # Function to take a screenshot and save it with a grid overlay
 
@@ -32,7 +44,7 @@ def take_screenshot_with_grid(filename):
     
 
     # Load a smaller font
-    font_size = 13  # Set the desired font size
+    font_size = 10  # Set the desired font size
     font = ImageFont.truetype("arial.ttf", font_size)  # Load the font with the specified size
 
     # Draw vertical lines and place value pairs
@@ -144,57 +156,130 @@ def extract_message_position(response_content):
         cleaned_content = response_content.strip().split('```json', 1)[-1].strip()
         cleaned_content = cleaned_content.split('```', 1)[0].strip()  # Get the content before the closing ```
 
-        print("cleaned_content: ", cleaned_content, "DONE")
-        response_data = json.loads(cleaned_content)
+        print("cleaned_content: ", cleaned_content)  # Log the cleaned content
+
+        if not cleaned_content:  # Check if cleaned_content is empty
+            print("Error: cleaned_content is empty.")
+            return None
+
+        response_data = json.loads(cleaned_content)  # Attempt to decode JSON
         message_position = response_data.get("message_position")
         return message_position  # Return the message position list
     except json.JSONDecodeError as e:
         print(f"Failed to decode JSON: {e}")
         return None
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        return None
 
 # Function to read the new message from Teams
 def read_new_message_from_teams():
-    teams_screenshot_filename = "screenshot.png"
-    teams_screenshot_with_grid_filename = "screenshot_with_grid.png"  # New filename for the grid screenshot
-    take_screenshot(teams_screenshot_filename)  # Take a new screenshot without grid
-    take_screenshot_with_grid(teams_screenshot_with_grid_filename)  # Take a new screenshot with grid
-    teams_screenshot_base64 = encode_image_to_base64(teams_screenshot_filename)
-    teams_screenshot_with_grid_base64 = encode_image_to_base64(teams_screenshot_with_grid_filename)  # Encode the grid screenshot
+    if current_state == State.IN_TEAMS:
+        teams_screenshot_filename = "screenshot.png"
+        teams_screenshot_with_grid_filename = "screenshot_with_grid.png"  # New filename for the grid screenshot
+        take_screenshot(teams_screenshot_filename)  # Take a new screenshot without grid
+        take_screenshot_with_grid(teams_screenshot_with_grid_filename)  # Take a new screenshot with grid
+        teams_screenshot_base64 = encode_image_to_base64(teams_screenshot_filename)
+        teams_screenshot_with_grid_base64 = encode_image_to_base64(teams_screenshot_with_grid_filename)  # Encode the grid screenshot
 
+        prompt = """
+            Please analyze the screenshot of the Teams window without the grid and tell me if there are any unread messages. Unread messages are denoted by 
+            a white dot and the preview being bold. If there are unread messages, respond "Yes".
+            Then, use the screenshot with the grid to provide the position of where the avatar of the unread message preview is, the unread message preview 
+            includes a picture of the user, the user's name, and a small text preview of the message. Give the position of each corner as a list of a
+            number pairs [(x, y),(x, y),(x, y),(x, y)] these pairs should be located in the grid overlay screenshot. Try and keep these within 3 of each other.
+            Return these in json format with the keys 'unread_message_present', and 'message_position'. The json should be formatted like this:
+            {
+                "unread_message_present": "Yes",
+                "message_position": [[x, y],[x, y],[x, y],[x, y]]
+            }
+            ensure that no values are missing.
+        """
+
+        response = send_to_openai([teams_screenshot_base64, teams_screenshot_with_grid_base64], prompt)  # Send both images
+        print(response.message.content)
+        
+        message_positions = extract_message_position(response.message.content.strip())  # Extract message positions
+        print("message_positions: ", message_positions)
+
+        if message_positions:
+            average_position = calculate_average_position(message_positions)  # Calculate average position
+            print("average_position: ", average_position)
+            if average_position:
+                # Convert grid position to pixel coordinates
+                grid_x, grid_y = average_position
+                pixel_x = (grid_x - 1) * spacing + (spacing // 2)  # Center the click in the grid cell
+                pixel_y = (grid_y - 1) * spacing + (spacing // 2) + 10 # Center the click in the grid cell
+                
+                # Move to the calculated position and click
+                pyautogui.moveTo(pixel_x, pixel_y, 1)  # Move to the average position
+                pyautogui.click()
+                print("clicked on avatar")
+
+                time.sleep(1.5)
+                check_if_new_message_and_respond()
+    elif current_state == State.MESSAGE_FOUND:
+        check_if_new_message_and_respond()
+
+def check_if_new_message_and_respond():
+    global current_state
+    global high_confidence_yes_count
+    current_state = State.CONFIDENCE_CHECK
+    screenshot_filename = "new_message.png"
+    take_screenshot(screenshot_filename)
+
+    new_message_base64 = encode_image_to_base64(screenshot_filename)
+    last_read_base64 = encode_image_to_base64("last_read.png")
     prompt = """
-        Please analyze the screenshot of the Teams window without the grid and tell me if there are any unread messages. Unread messages are denoted by 
-        a white dot and the preview being bold. If there are unread messages, respond "Yes".
-        Then, use the screenshot with the grid to provide the position of where the avatar of the unread message preview is, the unread message preview 
-        includes a picture of the user, the user's name, and a small text preview of the message. Give the position of each corner as a list of a
-        number pairs [(x, y),(x, y),(x, y),(x, y)] these pairs should be located in the grid overlay screenshot. Return these in json format with the 
-        keys 'unread_message_present', and 'message_position'. The json should be formatted like this:
-        {
-            "unread_message_present": "Yes",
-            "message_position": [[x, y],[x, y],[x, y],[x, y]]
-        }
-        ensure that no values are missing.
-    """
+        In the active chat screenshot, please check for the presence of a last read bar. 
+        A last read bar is typically a horizontal line or visual indicator that appears at the bottom of the chat window, 
+        indicating the most recent message from another user. It may be a different color or style compared to regular messages.
 
-    response = send_to_openai([teams_screenshot_base64, teams_screenshot_with_grid_base64], prompt)  # Send both images
-    print(response.message.content)
-    
-    message_positions = extract_message_position(response.message.content.strip())  # Extract message positions
-    print("message_positions: ", message_positions)
+            You are also provided with a reference image that shows an example of a last read bar. 
 
-    if message_positions:
-        average_position = calculate_average_position(message_positions)  # Calculate average position
-        print("average_position: ", average_position)
-        if average_position:
-            # Convert grid position to pixel coordinates
-            grid_x, grid_y = average_position
-            pixel_x = (grid_x - 1) * spacing + (spacing // 2)  # Center the click in the grid cell
-            pixel_y = (grid_y - 1) * spacing + (spacing // 2)  # Center the click in the grid cell
+            Respond with 'Yes' only if:
+            1. There is a last read bar present in the active chat screenshot that matches the reference image.
+            2. The most recent message is from a different user than the one currently active in the chat.
+
+            If a last read bar is present, please summarize the messages below and provide a response.
+            Additionally, include a confidence level (e.g., high, medium, low) regarding your assessment of the last read bar's presence.
+            Respond in JSON format, ensuring that no values are missing.
+            The object should have four keys: 
+            'last_read_bar_present', 'summary_of_messages', 'response', and 'confidence_level'.
+            """
             
-            # Move to the calculated position and click
-            pyautogui.moveTo(pixel_x, pixel_y, 3)  # Move to the average position
-            pyautogui.click()
+    response = send_to_openai([new_message_base64, last_read_base64], prompt)
+    print(response.message.content)
 
-    return response.message.content  # Return the response content
+    # New code to check for last_read_bar_present and act accordingly
+            
+    cleaned_content = response.message.content.strip().split('```json', 1)[-1].strip()
+    cleaned_content = cleaned_content.split('```', 1)[0].strip()
+    response_data = json.loads(cleaned_content)
+    if response_data.get('last_read_bar_present') == "Yes":
+        confidence_level = response_data.get('confidence_level', '').lower()
+        
+        # Check if the confidence level is high
+        if confidence_level == "high":
+            high_confidence_yes_count += 1  # Increment the counter
+        else:
+            high_confidence_yes_count = 0  # Reset the counter if not high
+            current_state = State.IN_TEAMS
+
+        # Run the conditional if there are 3 or more high confidence "Yes" responses
+        if high_confidence_yes_count >= 3:
+           
+            current_state = State.MESSAGE_FOUND
+            # Click at a specified location (example coordinates)
+            click_x, click_y = 800, 985  # Replace with actual coordinates
+            pyautogui.moveTo(click_x, click_y, 1)
+            pyautogui.click()
+            pyautogui.typewrite(response_data.get('response'), interval=0.1)  # Adjust typing speed as needed
+            current_state = State.RESPONSE_SENT
+    else:
+        print("Last read bar not present, trying again")
+        current_state = State.IN_TEAMS
+        
 
 # Function to check if we are in the Teams app
 def check_if_in_teams():
@@ -203,7 +288,12 @@ def check_if_in_teams():
     prompt = "Is the current window the Teams app? Please respond with 'Yes' or 'No'."
     
     response = send_to_openai([screenshot_base64], prompt)
-    return "Yes" in response.message.content
+    if "Yes" in response.message.content:
+        global current_state
+        current_state = State.IN_TEAMS
+        return True
+    else:
+        return False
 
 # Function to navigate to the coordinates and click
 def click_on_teams_shortcut(response_content):
@@ -238,18 +328,23 @@ def move_and_click_on_avatar(avatar_position):
 
     # Assuming avatar_position is in the format "(x, y)"
     x, y = map(int, avatar_position.strip("()").split(","))
-    pyautogui.moveTo(x, y, 3)  # Move to the avatar position
-    pyautogui.click()  # Click at that position
+    pyautogui.moveTo(x, y, 3) 
+    pyautogui.click()
+    
 
+# Function to minimize the current window
+def minimize_window():
+    pyautogui.moveTo(1810, 20, 1)
+    pyautogui.click()
 # Main function to take a screenshot and send it
 def main():
-    in_teams = False  # Initialize in_teams as False
+    global current_state
     while True:
-        if not in_teams:  # Only run this block if not in Teams
+        while current_state == State.POLLING:
             taskbar_screenshot_filename = "taskbar_screenshot.png"
             teams_shortcut_filename = "teams_shortcut.png"
             screenshot_filename = "screenshot.png"
-            
+                
             take_taskbar_screenshot(taskbar_screenshot_filename)
             take_screenshot(screenshot_filename)
 
@@ -260,32 +355,51 @@ def main():
             images = [taskbar_screenshot_base64, teams_shortcut_base64, screenshot_base64]
 
             prompt = """
-                Compare these two images, and tell me if there is currently a Teams message notification in the taskbar of the first image. 
-                If there is not a notification, please analyze the image and identify the position of the Teams icon.
-                Treat the icons on the taskbar as an array, starting from index 0 for the leftmost icon.
-                If the Teams icon is present, provide its index in the array.
+                    Compare these two images, and tell me if there is currently a Teams message notification in the taskbar of the first image. 
+                    If there is not a notification, please analyze the image and identify the position of the Teams icon.
+                    Start from index 1 on the leftmost icon, ignore the windows and search icons do NOT ignore the file explorer icon.
+                    If the Teams icon is present, provide its index in the array.
 
-                Respond in json format and be sure that no values are missing.
-                The object should have two keys: 
-                'notification_present', and 'teams_shortcut_position'.
-            """
+                    Respond in json format and be sure that no values are missing.
+                    The object should have two keys: 
+                    'notification_present', and 'teams_shortcut_position'.
+                """
 
             response = send_to_openai(images, prompt)
             response_content = response.message.content
 
             if "No" in response_content:
                 print("Teams message notification is not present in the taskbar screenshot.")
+                time.sleep(10)  
             else:
                 print(response_content)
                 in_teams = check_if_in_teams() 
-                if not in_teams:
-                    in_teams = click_on_teams_shortcut(response_content)
+            if not in_teams:
+                in_teams = click_on_teams_shortcut(response_content)
 
-        else:  # If in Teams, read the new message
+
+        while current_state == State.IN_TEAMS:
             new_message_response = read_new_message_from_teams()
             print("New message summary:", new_message_response)  # Print the summary of new messages
 
-        time.sleep(10)  # Wait for 10 seconds before taking another screenshot
+        while current_state == State.MESSAGE_FOUND or current_state == State.CONFIDENCE_CHECK:
+            try:
+                print(f"Current state: {current_state}")  # Log the current state
+                if current_state == State.CONFIDENCE_CHECK:
+                    check_if_new_message_and_respond()
+                    print("Checking confidence level...")
+                else:
+                    check_if_new_message_and_respond()
+                    print("Message found, responding...")
+            except Exception as e:
+                print(f"An error occurred: {e}")  # Log the error
+                current_state = State.IN_TEAMS  # Reset state to avoid termination
+
+        while current_state == State.RESPONSE_SENT:
+            print("Message responded to, ending program")
+            minimize_window()
+            current_state = State.POLLING
+
 
 if __name__ == "__main__":
     main()
